@@ -9,7 +9,7 @@ from torch.utils.tensorboard import SummaryWriter
 import random
 import cv2
 import hdbscan
-from Functions.function_PatchGAN import run_camera, load_model_weights, print_model_parameters, test_classifier, test_folder_predictions, perform_tsne, plot_tsne_interactive, compute_embeddings_with_paths, watch_folders_predictions, test_benchmark_folder
+from Functions.function_PatchGAN import run_camera, load_model_weights, print_model_parameters, test_classifier, test_folder_predictions, perform_tsne, plot_tsne_interactive, compute_embeddings_with_paths, watch_folders_predictions, test_benchmark_folder, run_inference
 from datas import MultiTaskDataset
 from Models.models_PatchGAN import MultiTaskPatchGANTest
 # -------------------------------------------------------------------
@@ -159,7 +159,9 @@ def main():
             transforms.ToTensor(),
             transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
         ])
-        dataset = MultiTaskDataset(data_json=args.data, classes_json=args.build_classifier, transform=transform, search_folder=args.search_folder)
+        dataset = MultiTaskDataset(data_json=args.data, classes_json=args.build_classifier, transform=transform,
+                                   search_folder=args.search_folder,
+                                   find_images_by_sub_folder=args.find_images_by_sub_folder)
 
         # Subset si args.num_samples
         if args.num_samples is not None:
@@ -296,7 +298,28 @@ def main():
         writer.close()
 
 
+    elif args.mode =="inference":
 
+        transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+        run_inference(
+            model=model,
+            image_folder=args.image_folder,
+            transform=transform,
+            device=device,
+            num_samples=args.num_samples,
+            save_dir=args.save_dir,
+            save_test_images=args.save_test_images,
+            classes=tasks_json,
+            visualize_gradcam=args.visualize_gradcam,
+            save_gradcam_images=args.save_gradcam_images,
+            gradcam_task=args.gradcam_task,
+
+        )
 
     elif args.mode == "watch_folder":
 

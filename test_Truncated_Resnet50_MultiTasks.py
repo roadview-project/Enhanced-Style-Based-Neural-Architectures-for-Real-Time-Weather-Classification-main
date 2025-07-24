@@ -132,7 +132,9 @@ def main():
         if args.data is None:
             raise ValueError("Le chemin vers les données '--data' doit être spécifié pour ce mode.")
         # Chargement du dataset
-        dataset = MultiTaskDataset(data_json=args.data, classes_json=args.build_classifier, transform=transform, search_folder=args.search_folder)
+        dataset = MultiTaskDataset(data_json=args.data, classes_json=args.build_classifier, transform=transform,
+                                   search_folder=args.search_folder,
+                                   find_images_by_sub_folder=args.find_images_by_sub_folder)
 
         # Application de num_samples si spécifié
         if args.num_samples is not None:

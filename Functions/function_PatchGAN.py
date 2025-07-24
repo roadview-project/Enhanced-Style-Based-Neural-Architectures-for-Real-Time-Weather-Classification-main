@@ -1135,7 +1135,256 @@ def test_folder_predictions(model, tasks, test_folder, transform, device, save_d
         print(f"Prédictions complètes sauvegardées dans {all_pred_json_path}")
 
 
+def collect_image_paths(folder):
+    """
+    Retourne la liste de tous les fichiers images dans `folder` et ses sous-dossiers.
+    """
+    paths = []
+    for root, _, files in os.walk(folder):
+        for fn in files:
+            ext = os.path.splitext(fn)[1].lower()
+            if ext in VALID_EXTS:
+                paths.append(os.path.join(root, fn))
+    return paths
 
+
+def annotate_and_save(
+    img: Image.Image,
+    text_lines,
+    out_path,
+    max_width_ratio: float = 0.35,   # ≤ 35 % de la largeur
+    min_font_px: int = 18,
+    max_font_px: int = 32,
+    pad_px: int = 10,
+    bg_alpha: int = 220             # fond blanc quasi-opaque
+):
+    """
+    Incruste un encart blanc + texte vert contour noir, ergonomique et lisible.
+    - L'encart n'excède jamais max_width_ratio * largeur de l'image.
+    - La taille de police est ajustée dans [min_font_px, max_font_px].
+    """
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+    W, H = img.size
+
+    # ----- police : on tente DejaVuSans-Bold puis fallback défaut -----
+    for name in ["DejaVuSans-Bold.ttf", "arialbd.ttf", "arial.ttf"]:
+        try:
+            font_path = name  # Pillow cherche dans ses fonts internes
+            break
+        except IOError:
+            font_path = None
+    if font_path is None:
+        font = ImageFont.load_default()
+    else:
+        font = ImageFont.truetype(font_path, size=min_font_px)
+
+    draw_tmp = ImageDraw.Draw(img)
+    target_width = W * max_width_ratio
+
+    # ----- ajuste dynamiquement la taille de police -----
+    fsize = min_font_px
+    while fsize < max_font_px:
+        cand = ImageFont.truetype(font_path, fsize + 2) if font_path else font
+        test_w = max(draw_tmp.textsize(t, cand)[0] for t in text_lines)
+        if test_w > target_width:          # on dépasse la limite
+            break
+        fsize += 2
+        font = cand
+
+    # ----- dimensions de la box -----
+    line_h = draw_tmp.textsize("Ag", font=font)[1]
+    block_w = min(target_width, max(draw_tmp.textsize(t, font=font)[0] for t in text_lines)) + 2 * pad_px
+    block_h = line_h * len(text_lines) + 2 * pad_px
+    x0, y0 = 10, 10                        # coin supérieur-gauche constant
+
+    # ----- overlay -----
+    overlay = Image.new("RGBA", img.size, (255, 255, 255, 0))
+    draw = ImageDraw.Draw(overlay)
+    draw.rectangle([x0, y0, x0 + block_w, y0 + block_h], fill=(255, 255, 255, bg_alpha))
+
+    # ----- texte avec contour noir fin -----
+    for i, line in enumerate(text_lines):
+        tx, ty = x0 + pad_px, y0 + pad_px + i * line_h
+        for dx, dy in [(-1,0), (1,0), (0,-1), (0,1)]:   # contour
+            draw.text((tx+dx, ty+dy), line, font=font, fill=(0,0,0,255))
+        draw.text((tx, ty), line, font=font, fill=(34,139,34,255))
+
+    result = Image.alpha_composite(img, overlay).convert("RGB")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    result.save(out_path)
+
+def pick_target_layer(model: torch.nn.Module, task_name: str = None):
+    """
+    Sélectionne de façon sécurisée une nn.Conv2d réellement utilisée.
+    - Si le modèle a des `task_heads`, on prend la dernière conv de la tête `task_name`.
+    - Sinon on prend la dernière conv du tronc ou du modèle complet.
+    """
+    # 1) tête spécifique
+    if task_name and hasattr(model, "task_heads") and task_name in model.task_heads:
+        for layer in reversed(list(model.task_heads[task_name].modules())):
+            if isinstance(layer, torch.nn.Conv2d):
+                return layer
+    # 2) tronc
+    if hasattr(model, "trunk"):
+        for layer in reversed(list(model.trunk.modules())):
+            if isinstance(layer, torch.nn.Conv2d):
+                return layer
+    # 3) fallback
+    for layer in reversed(list(model.modules())):
+        if isinstance(layer, torch.nn.Conv2d):
+            return layer
+    raise ValueError("Aucune nn.Conv2d trouvée pour Grad-CAM.")
+
+
+# -------------------------------------------------------------------
+#  PRINCIPALE
+# -------------------------------------------------------------------
+
+# ------------------------------------------------------------------
+# fonction principale
+# ------------------------------------------------------------------
+def run_inference(
+    model,
+    image_folder,
+    transform,
+    device,
+    classes,
+    num_samples=None,
+    save_dir=None,
+    save_test_images=False,
+    visualize_gradcam=False,
+    save_gradcam_images=False,
+    gradcam_task=None,
+    colormap="hot",
+):
+    # ---------- préparation (général) ----------
+    is_multi = isinstance(classes, dict)
+    classes_ci = {k.lower(): v for k, v in classes.items()} if is_multi else {}
+    paths = collect_image_paths(image_folder)
+    if not paths:
+        raise RuntimeError(f"Aucune image trouvée dans « {image_folder} »")
+    if num_samples and len(paths) > num_samples:
+        paths = random.sample(paths, num_samples)
+
+    model = model.to(device).eval()
+    results = {}
+
+    # ---------- préparation Grad-CAM ----------
+    grad_cam = None
+    if visualize_gradcam or save_gradcam_images:
+        if is_multi:
+            if gradcam_task is None:
+                gradcam_task = list(classes.keys())[0]
+            if gradcam_task not in classes:
+                raise ValueError(f"Tâche Grad-CAM inconnue : {gradcam_task}")
+            gradcam_model = TaskSpecificModel(model, gradcam_task).to(device)
+        else:
+            gradcam_model = model
+        gradcam_model.eval()
+
+        # dernière conv du tronc – même méthode que dans test_classifier
+        for layer in reversed(list(gradcam_model.model.trunk)):
+            if isinstance(layer, torch.nn.Conv2d):
+                target_layer = layer
+                break
+        else:
+            raise ValueError("Aucun nn.Conv2d trouvé pour Grad-CAM.")
+
+        grad_cam = GradCAM(model=gradcam_model, target_layers=[target_layer])
+        cmap_code = {
+            "hot": cv2.COLORMAP_HOT,
+            "jet": cv2.COLORMAP_JET,
+            "turbo": cv2.COLORMAP_TURBO,
+            "viridis": cv2.COLORMAP_VIRIDIS,
+            "inferno": cv2.COLORMAP_INFERNO,
+        }.get(colormap, cv2.COLORMAP_HOT)
+
+    # ---------- boucle images ----------
+    for pth in paths:
+        img = Image.open(pth).convert("RGB")
+        img_np = np.array(img)
+        x = transform(img).unsqueeze(0).to(device)
+
+        # ---- prédiction rapide
+        with torch.no_grad():
+            out = model(x)
+
+        lines, pred_gc_idx, prob_gc = [], None, None
+        if is_multi:
+            preds = {}
+            for task, logits in out.items():
+                probs = F.softmax(logits, 1)[0]
+                prob, idx = probs.max(0)
+                name = classes_ci[task.lower()][idx] if idx < len(classes_ci[task.lower()]) else str(idx.item())
+                preds[task] = {"predicted_class": name, "probability": prob.item()}
+                lines.append(f"{task}: {name} ({prob:.2f})")
+                if task == gradcam_task:
+                    pred_gc_idx, prob_gc = int(idx), float(prob)
+        else:
+            probs = F.softmax(out, 1)[0]
+            prob, idx = probs.max(0)
+            name = classes[idx] if idx < len(classes) else str(idx.item())
+            preds = {"predicted_class": name, "probability": prob.item()}
+            lines = [f"{name} ({prob:.2f})"]
+            pred_gc_idx, prob_gc = int(idx), float(prob)
+
+        results[pth] = preds
+
+        # ---- sauvegarde image annotée (texte simple)
+        if save_dir and save_test_images:
+            rel = os.path.relpath(pth, image_folder)
+            annotate_and_save(img, lines, os.path.join(save_dir, rel))
+
+        # ---- Grad-CAM
+        if grad_cam is not None:
+            x_gc = x.clone().requires_grad_(True)
+            cam = grad_cam(input_tensor=x_gc, targets=[ClassifierOutputTarget(pred_gc_idx)])[0]
+            cam = (cam - cam.min()) / (cam.ptp() + 1e-8)
+            heat = cv2.applyColorMap(
+                np.uint8(255 * cv2.resize(cam, (img_np.shape[1], img_np.shape[0]))),
+                cmap_code,
+            )
+            heat = cv2.cvtColor(heat, cv2.COLOR_BGR2RGB)
+            fusion = np.clip(0.5 * img_np + 0.5 * heat, 0, 255).astype(np.uint8)
+
+            # ---------- annotation fond blanc + texte vert ----------
+            task_lbl = gradcam_task if is_multi else "Task"
+            class_lbl = (
+                classes_ci[gradcam_task.lower()][pred_gc_idx] if is_multi
+                else classes[pred_gc_idx]
+            )
+            txt_line = f"{task_lbl}: {class_lbl} ({prob_gc:.2f})"
+            fusion_pil = Image.fromarray(fusion)
+            fname = os.path.splitext(os.path.basename(pth))[0]
+            out_dir = os.path.join(save_dir, "GradCAM", class_lbl)
+            os.makedirs(out_dir, exist_ok=True)
+            # version fusion annotée
+            annotate_and_save(
+                fusion_pil, [txt_line],
+                os.path.join(out_dir, f"{fname}_fusion.jpg")
+            )
+            # heat-map seule (optionnelle) – pas de texte
+            if save_gradcam_images:
+                cv2.imwrite(
+                    os.path.join(out_dir, f"{fname}_heatmap.jpg"),
+                    cv2.cvtColor(heat, cv2.COLOR_RGB2BGR),
+                )
+
+            if visualize_gradcam and not save_gradcam_images:
+                import matplotlib.pyplot as plt
+                plt.imshow(fusion)
+                plt.title(txt_line)
+                plt.axis("off")
+                plt.show()
+
+    # ---------- JSON global ----------
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        with open(os.path.join(save_dir, "inference_results.json"), "w") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+
+    return results
 
 # -----------------------------------------------------------------------
 # FONCTIONS D'ENTRAINEMENT & EVALUATION
