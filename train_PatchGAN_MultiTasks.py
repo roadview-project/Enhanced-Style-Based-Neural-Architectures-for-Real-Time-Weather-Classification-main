@@ -65,7 +65,9 @@ def main():
     ])
 
     # Chargement du dataset et des tâches
-    dataset = MultiTaskDataset(data_json=args.data, classes_json=args.build_classifier, transform=transform, search_folder=args.search_folder)
+    dataset = MultiTaskDataset(data_json=args.data, classes_json=args.build_classifier, transform=transform,
+                               search_folder=args.search_folder,
+                               find_images_by_sub_folder=args.find_images_by_sub_folder)
     tasks_dict = {task_name: len(class_list) for task_name, class_list in dataset.classes.items()}
     print("Tâches chargées :")
     for t, n in tasks_dict.items():
